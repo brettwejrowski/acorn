@@ -50,16 +50,58 @@ const target  = args.find(a => !a.startsWith("--")) || __filename
 
 if (help) {
   console.log(`
-Usage: node visualize-ast.js [options] [file]
+Usage: node visualize-ast.js [options] [file|url]
 
 Options:
   --no-color   Disable ANSI color output
   --help, -h   Show this help message
 
 Arguments:
-  file         JavaScript file to visualize (default: this script)
+  file         Local JavaScript file to visualize (default: this script)
+  url          GitHub file URL or raw.githubusercontent.com URL
+
+Examples:
+  node visualize-ast.js
+  node visualize-ast.js path/to/file.js
+  node visualize-ast.js https://github.com/owner/repo/blob/main/src/index.js
+  node visualize-ast.js https://raw.githubusercontent.com/owner/repo/main/src/index.js
 `)
   process.exit(0)
+}
+
+// ---------------------------------------------------------------------------
+// GitHub URL helpers
+// ---------------------------------------------------------------------------
+function isUrl(s) {
+  return /^https?:\/\//i.test(s)
+}
+
+// Convert a github.com blob URL to its raw.githubusercontent.com equivalent.
+// Any other URL (including already-raw URLs) is returned unchanged.
+function toRawGitHubUrl(url) {
+  const m = url.match(/^https?:\/\/github\.com\/([^/]+\/[^/]+)\/blob\/(.+)$/)
+  if (m) return `https://raw.githubusercontent.com/${m[1]}/${m[2]}`
+  return url
+}
+
+// Fetch a URL, following up to 5 redirects, and return the body as a string.
+function fetchUrl(url, redirectsLeft = 5) {
+  return new Promise((resolve, reject) => {
+    const mod = url.startsWith("https") ? require("https") : require("http")
+    mod.get(url, res => {
+      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+        if (redirectsLeft === 0) return reject(new Error("Too many redirects"))
+        return fetchUrl(res.headers.location, redirectsLeft - 1).then(resolve, reject)
+      }
+      if (res.statusCode !== 200) {
+        return reject(new Error(`HTTP ${res.statusCode} for ${url}`))
+      }
+      const chunks = []
+      res.on("data", c => chunks.push(c))
+      res.on("end",  () => resolve(Buffer.concat(chunks).toString("utf8")))
+      res.on("error", reject)
+    }).on("error", reject)
+  })
 }
 
 // ---------------------------------------------------------------------------
@@ -241,66 +283,85 @@ function printNode(node, prefix, isLast) {
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
-const filePath = path.resolve(target)
-const src      = fs.readFileSync(filePath, "utf8")
+async function main() {
+  let src, displayPath
 
-// Strip shebang so acorn doesn't choke on it
-const parseSrc = src.startsWith("#!") ? src.replace(/^#!.*/, "") : src
+  if (isUrl(target)) {
+    const rawUrl = toRawGitHubUrl(target)
+    if (rawUrl !== target) {
+      process.stderr.write(C.dim(`→ raw: ${rawUrl}\n`))
+    }
+    process.stderr.write(C.dim(`Fetching…\n`))
+    src         = await fetchUrl(rawUrl)
+    displayPath = target
+  } else {
+    displayPath = path.resolve(target)
+    src         = fs.readFileSync(displayPath, "utf8")
+  }
 
-let ast
-try {
-  ast = acorn.parse(parseSrc, {
-    ecmaVersion: 2022,
-    sourceType:  "script",
-    locations:   true,
+  // Strip shebang so acorn doesn't choke on it
+  const parseSrc = src.startsWith("#!") ? src.replace(/^#!.*/, "") : src
+
+  let ast
+  try {
+    ast = acorn.parse(parseSrc, {
+      ecmaVersion: 2022,
+      sourceType:  "script",
+      locations:   true,
+    })
+  } catch (_) {
+    // Try again as a module if script mode fails
+    ast = acorn.parse(parseSrc, {
+      ecmaVersion: 2022,
+      sourceType:  "module",
+      locations:   true,
+    })
+  }
+
+  const lines = src.split("\n").length
+  console.log()
+  console.log(
+    `\x1b[1mAST Visualization\x1b[0m  ${C.dim("─".repeat(40))}`,
+  )
+  console.log(
+    `${C.key("File")}     : ${C.val(displayPath)}`,
+  )
+  console.log(
+    `${C.key("Parser")}  : acorn ${C.val(acorn.version)}`,
+  )
+  console.log(
+    `${C.key("Lines")}   : ${C.num(lines)}  ${C.key("Nodes")} : ${C.num(countNodes(ast))}`,
+  )
+  console.log(C.dim("─".repeat(52)))
+  console.log()
+
+  // Print the root without a connector prefix
+  console.log(C.node(ast.type))
+  const topChildren = childEntries(ast)
+  topChildren.forEach(([k, v], i) => {
+    const last    = i === topChildren.length - 1
+    const propPfx = last ? BLANK : VERT
+
+    if (Array.isArray(v)) {
+      if (v.length === 0) return
+      console.log(C.branch(last ? LAST : TEE) + C.key(k) + C.dim(` [${v.length}]`))
+      v.forEach((item, j) => {
+        const lastItem = j === v.length - 1
+        printNode(item, propPfx, lastItem)
+      })
+    } else if (v && typeof v === "object" && v.type) {
+      console.log(C.branch(last ? LAST : TEE) + C.key(k))
+      printNode(v, propPfx, true)
+    }
   })
-} catch (err) {
-  // Try again as a module if script mode fails
-  ast = acorn.parse(parseSrc, {
-    ecmaVersion: 2022,
-    sourceType:  "module",
-    locations:   true,
-  })
+
+  console.log()
 }
 
-const lines = src.split("\n").length
-console.log()
-console.log(
-  `\x1b[1mAST Visualization\x1b[0m  ${C.dim("─".repeat(40))}`,
-)
-console.log(
-  `${C.key("File")}     : ${C.val(filePath)}`,
-)
-console.log(
-  `${C.key("Parser")}  : acorn ${C.val(acorn.version)}`,
-)
-console.log(
-  `${C.key("Lines")}   : ${C.num(lines)}  ${C.key("Nodes")} : ${C.num(countNodes(ast))}`,
-)
-console.log(C.dim("─".repeat(52)))
-console.log()
-
-// Print the root without a connector prefix
-console.log(C.node(ast.type))
-const topChildren = childEntries(ast)
-topChildren.forEach(([k, v], i) => {
-  const last   = i === topChildren.length - 1
-  const propPfx = last ? BLANK : VERT
-
-  if (Array.isArray(v)) {
-    if (v.length === 0) return
-    console.log(C.branch(last ? LAST : TEE) + C.key(k) + C.dim(` [${v.length}]`))
-    v.forEach((item, j) => {
-      const lastItem = j === v.length - 1
-      printNode(item, propPfx, lastItem)
-    })
-  } else if (v && typeof v === "object" && v.type) {
-    console.log(C.branch(last ? LAST : TEE) + C.key(k))
-    printNode(v, propPfx, true)
-  }
+main().catch(err => {
+  console.error(`\x1b[31mError:\x1b[0m ${err.message}`)
+  process.exit(1)
 })
-
-console.log()
 
 // ---------------------------------------------------------------------------
 // Count total AST nodes
